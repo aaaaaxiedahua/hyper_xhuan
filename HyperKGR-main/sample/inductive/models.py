@@ -244,16 +244,33 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 
+class RicciGating(nn.Module):
+    """Query-Conditioned Ricci Gating: 用 query relation 决定如何利用边的拓扑曲率"""
+    def __init__(self, in_dim):
+        super(RicciGating, self).__init__()
+        self.phi_net = nn.Linear(in_dim, 1)
+        self.beta = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, ricci_vals, h_qr):
+        """
+        ricci_vals: [N_edge, 1] 预计算的 Ollivier-Ricci 曲率
+        h_qr:      [N_edge, d] query relation embedding (per edge)
+        return:    [N_edge, 1] gate value in [-1, 1]
+        """
+        phi = self.phi_net(h_qr)                           # [N_edge, 1]
+        gate = torch.tanh(self.beta * phi * ricci_vals)     # [N_edge, 1]
+        return gate
+
+
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, rel_curvature=False, einstein_agg=False):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_ricci=False):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
-        self.rel_curvature = rel_curvature
-        self.einstein_agg = einstein_agg
+        self.use_ricci = use_ricci
         self.rela_embed = nn.Embedding(2*n_rel+1, in_dim)
 
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -262,15 +279,14 @@ class GNNLayer(torch.nn.Module):
         self.W_attn = nn.Linear(attn_dim, 1, bias=False)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        if self.rel_curvature:
-            self.curvature_delta = nn.Embedding(2*n_rel+1, 1)
-            nn.init.constant_(self.curvature_delta.weight, 0.0)
-            self.curvature_global = nn.Parameter(torch.tensor(1.0))
-        else:
-            self.curvature = nn.Parameter(torch.tensor(1.0))
+        if self.use_ricci:
+            self.ricci_gating = RicciGating(in_dim)
+
+        #self.curvature = torch.nn.Parameter(torch.tensor(1.0))
+        self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
 
 
-    def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx):
+    def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx, ricci_vals=None):
         # edges:  [batch_idx, head, rela, tail, old_idx, new_idx]
         sub = edges[:,4]
         rel = edges[:,2]
@@ -285,48 +301,37 @@ class GNNLayer(torch.nn.Module):
 
         # put attention here, this for nell
         mess1 = hs
-        alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
-
-        # determine curvatures
-        if self.rel_curvature:
-            c_global = self.curvature_global.abs().clamp(min=1e-6, max=10.0)
-            delta = self.curvature_delta(rel).tanh() * 0.5  # [-0.5, 0.5]
-            c_edge = (c_global + delta).clamp(min=1e-6, max=10.0)
+        alpha_feat = self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)))
+        if self.use_ricci and ricci_vals is not None:
+            ricci_gate = self.ricci_gating(ricci_vals.unsqueeze(-1), h_qr)
+            alpha_2 = torch.sigmoid(alpha_feat + ricci_gate)
         else:
-            c_edge = self.curvature.abs().clamp(min=1e-6, max=10.0)
-            c_global = c_edge
+            alpha_2 = torch.sigmoid(alpha_feat)
 
-        # suppose all embedding are in tangent space
-        hr = expmap0(hr, c_edge) # to hyperbolic
-        hs = expmap0(hs, c_edge)
+        # suppose all embedding are in tangetn space
+        hr = expmap0(hr, self.curvature) # to hyperbo
+        hs = expmap0(hs, self.curvature)
 
         mess1 = hs
-        h_qr = expmap0(h_qr, c_edge)
+        h_qr = expmap0(h_qr, self.curvature)
         # or put attention here, this is for fb and winrr
         #alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
-        mess2 = project(mobius_add(hs, hr, c_edge), c_edge)
+        mess2 = project(mobius_add(hs, hr, self.curvature), self.curvature)
+        #mess2 = hs + hr
+        mess2 = logmap0(mess2, self.curvature) # to tangent
 
-        if self.einstein_agg:
-            # Einstein midpoint aggregation: stay in hyperbolic space
-            sqnorm = (mess2 * mess2).sum(dim=-1, keepdim=True)
-            gamma = 1.0 / torch.sqrt((1 - c_global * sqnorm).clamp_min(1e-8))
-            weight = alpha_2 * gamma
-            weighted_sum = scatter(weight * mess2, index=obj, dim=0, dim_size=n_node, reduce='sum')
-            weight_sum = scatter(weight, index=obj, dim=0, dim_size=n_node, reduce='sum')
-            midpoint = weighted_sum / weight_sum.clamp_min(1e-8)
-            message_agg = logmap0(project(midpoint, c_global), c_global)
-        else:
-            # original flow: logmap0 -> scatter_sum
-            mess2 = logmap0(mess2, c_edge) # to tangent
-            message = mess2 * alpha_2
-            message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
+        message = mess2*alpha_2
+        message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
+
+        #hidden_new =  self.W_h(message_agg)
+        #hidden_new = self.act(hidden_new)
 
         # to poincare space
         a__ = self.W_h(message_agg)
-        a__ = expmap0(a__, c_global)
+        a__ = expmap0(a__, self.curvature)
         hidden_new = self.act(a__)
-        hidden_new = logmap0(hidden_new, c_global)
+        hidden_new = logmap0(hidden_new, self.curvature)
 
         return hidden_new
     
@@ -381,6 +386,7 @@ class GNNModel(torch.nn.Module):
         self.loader = loader
         self.increase = params.increase
         self.topk = params.topk
+        self.use_ricci = getattr(params, 'use_ricci', False)
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         dropout = params.dropout
@@ -388,7 +394,7 @@ class GNNModel(torch.nn.Module):
         self.layers = []
         self.Ws_layers = []
         for i in range(self.n_layer):
-            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, rel_curvature=params.rel_curvature, einstein_agg=params.einstein_agg))
+            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_ricci=self.use_ricci))
             self.Ws_layers.append(nn.Linear(self.hidden_dim, 1, bias=False))
         self.layers = nn.ModuleList(self.layers)
         self.Ws_layers = nn.ModuleList(self.Ws_layers)
@@ -435,11 +441,11 @@ class GNNModel(torch.nn.Module):
         
         for i in range(self.n_layer):
             t_1 = time.time()
-            nodes, edges, old_nodes_new_idx = self.loader.get_neighbors(nodes.data.cpu().numpy(), mode)
+            nodes, edges, old_nodes_new_idx, ricci_vals = self.loader.get_neighbors(nodes.data.cpu().numpy(), mode)
             time_1 += time.time() - t_1
 
             t_2 = time.time()
-            hidden = self.layers[i](q_sub, q_rel, hidden, edges, nodes.size(0), old_nodes_new_idx)
+            hidden = self.layers[i](q_sub, q_rel, hidden, edges, nodes.size(0), old_nodes_new_idx, ricci_vals)
             h0 = torch.zeros(1, nodes.size(0), hidden.size(1)).cuda().index_copy_(1, old_nodes_new_idx, h0)
             hidden = self.dropout(hidden)
             hidden, h0 = self.gru(hidden.unsqueeze(0), h0)

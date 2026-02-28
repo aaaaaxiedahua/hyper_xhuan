@@ -245,13 +245,15 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, rel_curvature=False, einstein_agg=False):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
+        self.rel_curvature = rel_curvature
+        self.einstein_agg = einstein_agg
         self.rela_embed = nn.Embedding(2*n_rel+1, in_dim)
 
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -259,9 +261,13 @@ class GNNLayer(torch.nn.Module):
         self.Wqr_attn = nn.Linear(in_dim, attn_dim)
         self.W_attn = nn.Linear(attn_dim, 1, bias=False)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
-        
-        #self.curvature = torch.nn.Parameter(torch.tensor(1.0)) 
-        self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
+
+        if self.rel_curvature:
+            self.curvature_embed = nn.Embedding(2*n_rel+1, 1)
+            nn.init.constant_(self.curvature_embed.weight, 1.0)
+            self.curvature_global = nn.Parameter(torch.tensor(1.0))
+        else:
+            self.curvature = nn.Parameter(torch.tensor(1.0))
 
 
     def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx):
@@ -278,34 +284,49 @@ class GNNLayer(torch.nn.Module):
         h_qr = self.rela_embed(q_rel)[r_idx]
 
         # put attention here, this for nell
-        mess1 = hs 
+        mess1 = hs
         alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
-        # suppose all embedding are in tangetn space
-        hr = expmap0(hr, self.curvature) # to hyperbo
-        hs = expmap0(hs, self.curvature)
+        # determine curvatures
+        if self.rel_curvature:
+            c_edge = self.curvature_embed(rel).abs().clamp(min=1e-6, max=10.0)  # [N_edge, 1]
+            c_global = self.curvature_global.abs().clamp(min=1e-6, max=10.0)
+        else:
+            c_edge = self.curvature.abs().clamp(min=1e-6, max=10.0)
+            c_global = c_edge
 
-        mess1 = hs 
-        h_qr = expmap0(h_qr, self.curvature)
+        # suppose all embedding are in tangent space
+        hr = expmap0(hr, c_edge) # to hyperbolic
+        hs = expmap0(hs, c_edge)
+
+        mess1 = hs
+        h_qr = expmap0(h_qr, c_edge)
         # or put attention here, this is for fb and winrr
         #alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
-        
-        mess2 = project(mobius_add(hs, hr, self.curvature), self.curvature)
-        #mess2 = hs + hr
-        mess2 = logmap0(mess2, self.curvature) # to tangent
-        
-        message = mess2*alpha_2
-        message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
-        
-        #hidden_new =  self.W_h(message_agg)
-        #hidden_new = self.act(hidden_new)
+
+        mess2 = project(mobius_add(hs, hr, c_edge), c_edge)
+
+        if self.einstein_agg:
+            # Einstein midpoint aggregation: stay in hyperbolic space
+            sqnorm = (mess2 * mess2).sum(dim=-1, keepdim=True)
+            gamma = 1.0 / torch.sqrt((1 - c_edge * sqnorm).clamp_min(1e-8))
+            weight = alpha_2 * gamma
+            weighted_sum = scatter(weight * mess2, index=obj, dim=0, dim_size=n_node, reduce='sum')
+            weight_sum = scatter(weight, index=obj, dim=0, dim_size=n_node, reduce='sum')
+            midpoint = weighted_sum / weight_sum.clamp_min(1e-8)
+            message_agg = logmap0(project(midpoint, c_global), c_global)
+        else:
+            # original flow: logmap0 -> scatter_sum
+            mess2 = logmap0(mess2, c_edge) # to tangent
+            message = mess2 * alpha_2
+            message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
 
         # to poincare space
         a__ = self.W_h(message_agg)
-        a__ = expmap0(a__, self.curvature)
+        a__ = expmap0(a__, c_global)
         hidden_new = self.act(a__)
-        hidden_new = logmap0(hidden_new, self.curvature)
-        
+        hidden_new = logmap0(hidden_new, c_global)
+
         return hidden_new
     
 
@@ -366,7 +387,7 @@ class GNNModel(torch.nn.Module):
         self.layers = []
         self.Ws_layers = []
         for i in range(self.n_layer):
-            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act))
+            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, rel_curvature=params.rel_curvature, einstein_agg=params.einstein_agg))
             self.Ws_layers.append(nn.Linear(self.hidden_dim, 1, bias=False))
         self.layers = nn.ModuleList(self.layers)
         self.Ws_layers = nn.ModuleList(self.Ws_layers)

@@ -8,6 +8,8 @@ from utils import select_gpu
 parser = argparse.ArgumentParser(description="Parser for AdaProp")
 parser.add_argument('--data_path', type=str, default='./data/fb237_v1')
 parser.add_argument('--seed', type=str, default=1234)
+parser.add_argument('--rel_curvature', action='store_true')   # 开启关系特定曲率
+parser.add_argument('--einstein_agg', action='store_true')     # 开启 Einstein midpoint 聚合
 args = parser.parse_args()
 
 class Options(object):
@@ -53,6 +55,8 @@ def run_model(params):
     opts.n_batch = params['n_batch']
     opts.topk = params['topk']
     opts.increase = params['increase']
+    opts.rel_curvature = args.rel_curvature
+    opts.einstein_agg = args.einstein_agg
 
     config_str = '%.4f, %.4f, %.6f,  %d, %d, %d, %d, %d, %.4f, %s  %d, %s\n' % (opts.lr, opts.decay_rate, opts.lamb, opts.hidden_dim, opts.init_dim, opts.attn_dim, opts.n_layer, opts.n_batch, opts.dropout, opts.act, opts.topk, str(opts.increase))
     print(args.data_path)

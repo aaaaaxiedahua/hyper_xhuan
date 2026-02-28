@@ -263,8 +263,8 @@ class GNNLayer(torch.nn.Module):
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
         if self.rel_curvature:
-            self.curvature_embed = nn.Embedding(2*n_rel+1, 1)
-            nn.init.constant_(self.curvature_embed.weight, 1.0)
+            self.curvature_delta = nn.Embedding(2*n_rel+1, 1)
+            nn.init.constant_(self.curvature_delta.weight, 0.0)
             self.curvature_global = nn.Parameter(torch.tensor(1.0))
         else:
             self.curvature = nn.Parameter(torch.tensor(1.0))
@@ -289,8 +289,9 @@ class GNNLayer(torch.nn.Module):
 
         # determine curvatures
         if self.rel_curvature:
-            c_edge = self.curvature_embed(rel).abs().clamp(min=1e-6, max=10.0)  # [N_edge, 1]
             c_global = self.curvature_global.abs().clamp(min=1e-6, max=10.0)
+            delta = self.curvature_delta(rel).tanh() * 0.5  # [-0.5, 0.5]
+            c_edge = (c_global + delta).clamp(min=1e-6, max=10.0)
         else:
             c_edge = self.curvature.abs().clamp(min=1e-6, max=10.0)
             c_global = c_edge
@@ -309,7 +310,7 @@ class GNNLayer(torch.nn.Module):
         if self.einstein_agg:
             # Einstein midpoint aggregation: stay in hyperbolic space
             sqnorm = (mess2 * mess2).sum(dim=-1, keepdim=True)
-            gamma = 1.0 / torch.sqrt((1 - c_edge * sqnorm).clamp_min(1e-8))
+            gamma = 1.0 / torch.sqrt((1 - c_global * sqnorm).clamp_min(1e-8))
             weight = alpha_2 * gamma
             weighted_sum = scatter(weight * mess2, index=obj, dim=0, dim_size=n_node, reduce='sum')
             weight_sum = scatter(weight, index=obj, dim=0, dim_size=n_node, reduce='sum')

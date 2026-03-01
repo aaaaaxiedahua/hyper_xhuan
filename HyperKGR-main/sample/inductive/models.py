@@ -244,33 +244,15 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 
-class RicciGating(nn.Module):
-    """Query-Conditioned Ricci Gating: 用 query relation 决定如何利用边的拓扑曲率"""
-    def __init__(self, in_dim):
-        super(RicciGating, self).__init__()
-        self.phi_net = nn.Linear(in_dim, 1)
-        self.beta = nn.Parameter(torch.tensor(1.0))
-
-    def forward(self, ricci_vals, h_qr):
-        """
-        ricci_vals: [N_edge, 1] 预计算的 Ollivier-Ricci 曲率
-        h_qr:      [N_edge, d] query relation embedding (per edge)
-        return:    [N_edge, 1] gate value in [-1, 1]
-        """
-        phi = self.phi_net(h_qr)                           # [N_edge, 1]
-        gate = torch.tanh(self.beta * phi * ricci_vals)     # [N_edge, 1]
-        return gate
-
-
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_ricci=False):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_path_comp=False):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
-        self.use_ricci = use_ricci
+        self.use_path_comp = use_path_comp
         self.rela_embed = nn.Embedding(2*n_rel+1, in_dim)
 
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -279,14 +261,14 @@ class GNNLayer(torch.nn.Module):
         self.W_attn = nn.Linear(attn_dim, 1, bias=False)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        if self.use_ricci:
-            self.ricci_gating = RicciGating(in_dim)
+        if use_path_comp:
+            self.Wp_attn = nn.Linear(in_dim, attn_dim, bias=False)
 
         #self.curvature = torch.nn.Parameter(torch.tensor(1.0))
         self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
 
 
-    def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx, ricci_vals=None):
+    def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx, path_state=None):
         # edges:  [batch_idx, head, rela, tail, old_idx, new_idx]
         sub = edges[:,4]
         rel = edges[:,2]
@@ -301,12 +283,11 @@ class GNNLayer(torch.nn.Module):
 
         # put attention here, this for nell
         mess1 = hs
-        alpha_feat = self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)))
-        if self.use_ricci and ricci_vals is not None:
-            ricci_gate = self.ricci_gating(ricci_vals.unsqueeze(-1), h_qr)
-            alpha_2 = torch.sigmoid(alpha_feat + ricci_gate)
-        else:
-            alpha_2 = torch.sigmoid(alpha_feat)
+        attn_input = self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
+        if self.use_path_comp and path_state is not None:
+            path_per_edge = path_state[r_idx]
+            attn_input = attn_input + self.Wp_attn(path_per_edge)
+        alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(attn_input)))
 
         # suppose all embedding are in tangetn space
         hr = expmap0(hr, self.curvature) # to hyperbo
@@ -386,7 +367,8 @@ class GNNModel(torch.nn.Module):
         self.loader = loader
         self.increase = params.increase
         self.topk = params.topk
-        self.use_ricci = getattr(params, 'use_ricci', False)
+        self.use_path_comp = getattr(params, 'use_path_comp', False)
+        self.use_hyp_cl = getattr(params, 'use_hyp_cl', False)
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         dropout = params.dropout
@@ -394,11 +376,14 @@ class GNNModel(torch.nn.Module):
         self.layers = []
         self.Ws_layers = []
         for i in range(self.n_layer):
-            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_ricci=self.use_ricci))
+            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_path_comp=self.use_path_comp))
             self.Ws_layers.append(nn.Linear(self.hidden_dim, 1, bias=False))
         self.layers = nn.ModuleList(self.layers)
         self.Ws_layers = nn.ModuleList(self.Ws_layers)
-       
+
+        if self.use_path_comp:
+            self.path_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
+
         self.dropout = nn.Dropout(dropout)
         self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)         # get score
         self.gru = nn.GRU(self.hidden_dim, self.hidden_dim)
@@ -438,29 +423,47 @@ class GNNModel(torch.nn.Module):
         hidden = torch.zeros(n, self.hidden_dim).cuda()
         time_1 = 0
         time_2 = 0
-        
+
+        # path composition: init path_state with query relation embedding
+        if self.use_path_comp:
+            c = self.layers[0].curvature
+            path_state = self.path_rela_embed(q_rel)  # [n, d] tangent space
+
         for i in range(self.n_layer):
             t_1 = time.time()
-            nodes, edges, old_nodes_new_idx, ricci_vals = self.loader.get_neighbors(nodes.data.cpu().numpy(), mode)
+            nodes, edges, old_nodes_new_idx = self.loader.get_neighbors(nodes.data.cpu().numpy(), mode)
             time_1 += time.time() - t_1
 
             t_2 = time.time()
-            hidden = self.layers[i](q_sub, q_rel, hidden, edges, nodes.size(0), old_nodes_new_idx, ricci_vals)
+            ps = path_state if self.use_path_comp else None
+            hidden = self.layers[i](q_sub, q_rel, hidden, edges, nodes.size(0), old_nodes_new_idx, ps)
+
+            # update path_state via hyperbolic composition
+            if self.use_path_comp:
+                rel = edges[:, 2]
+                r_idx = edges[:, 0]
+                hr_path = self.path_rela_embed(rel)                                          # [N_edge, d]
+                rel_agg = scatter(hr_path, index=r_idx, dim=0, dim_size=n, reduce='mean')    # [n, d]
+                path_hyp = expmap0(path_state, c)
+                rel_hyp = expmap0(rel_agg, c)
+                path_hyp = project(mobius_add(path_hyp, rel_hyp, c), c)
+                path_state = logmap0(path_hyp, c)                                            # [n, d] back to tangent
+
             h0 = torch.zeros(1, nodes.size(0), hidden.size(1)).cuda().index_copy_(1, old_nodes_new_idx, h0)
             hidden = self.dropout(hidden)
             hidden, h0 = self.gru(hidden.unsqueeze(0), h0)
             hidden = hidden.squeeze(0)
-            
+
             if i < self.n_layer-1:
                 if self.increase:
                     hidde, bool_same_nodes = self.soft_to_hard(i, hidden, nodes, n_ent, n, old_nodes_new_idx)
                 else:
                     exit()
-                    
+
                 nodes = nodes[bool_same_nodes]
                 hidden = hidden[bool_same_nodes]
                 h0 = h0[:,bool_same_nodes]
-                
+
             time_2 += time.time() - t_2
 
         self.time_1 = time_1
@@ -468,6 +471,12 @@ class GNNModel(torch.nn.Module):
         scores = self.W_final(hidden).squeeze(-1)
         scores_all = torch.zeros((n, n_ent)).cuda()
         scores_all[[nodes[:,0], nodes[:,1]]] = scores
+
+        # store hidden/nodes for contrastive loss during training
+        if self.training and self.use_hyp_cl:
+            self.cl_hidden = hidden
+            self.cl_nodes = nodes
+
         return scores_all
 
 

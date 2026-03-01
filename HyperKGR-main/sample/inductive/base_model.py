@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import time
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ExponentialLR
-from models import GNNModel
+from models import GNNModel, expmap0, hyp_distance
 from utils import cal_ranks, cal_performance
 
 class BaseModel(object):
@@ -23,6 +24,9 @@ class BaseModel(object):
         self.scheduler = ExponentialLR(self.optimizer, args.decay_rate)
         self.smooth = 1e-5
         self.params = args
+        self.use_hyp_cl = getattr(args, 'use_hyp_cl', False)
+        self.lambda_cl = getattr(args, 'lambda_cl', 0.1)
+        self.tau_cl = getattr(args, 'tau_cl', 0.5)
 
     def train_batch(self,):
         epoch_loss = 0
@@ -49,6 +53,10 @@ class BaseModel(object):
             max_n = torch.max(scores, 1, keepdim=True)[0]
             loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
 
+            if self.use_hyp_cl:
+                loss_cl = self.contrastive_loss(triple)
+                loss = loss + self.lambda_cl * loss_cl
+
             loss.backward()
             self.optimizer.step()
             self.time_2 += time.time() - t_2
@@ -64,6 +72,57 @@ class BaseModel(object):
         self.scheduler.step()
         valid_mrr, test_mrr, out_str = self.evaluate()
         return valid_mrr, test_mrr, out_str
+
+    def contrastive_loss(self, triple):
+        hidden = self.model.cl_hidden   # [n_node, d]
+        nodes = self.model.cl_nodes     # [n_node, 2] (batch_idx, entity_id)
+        c = self.model.layers[-1].curvature
+        n = len(triple)
+
+        batch_ids = nodes[:, 0]
+        ent_ids = nodes[:, 1]
+        query_ents = torch.LongTensor(triple[:, 0]).cuda()
+        pos_ents = torch.LongTensor(triple[:, 2]).cuda()
+
+        h_hyp = expmap0(hidden, c)
+
+        anchor_idx = []
+        pos_idx = []
+        for i in range(n):
+            a_mask = (batch_ids == i) & (ent_ids == query_ents[i])
+            p_mask = (batch_ids == i) & (ent_ids == pos_ents[i])
+            if a_mask.any() and p_mask.any():
+                anchor_idx.append(a_mask.nonzero()[0, 0])
+                pos_idx.append(p_mask.nonzero()[0, 0])
+
+        if len(anchor_idx) == 0:
+            return torch.tensor(0.0).cuda()
+
+        anchor_idx = torch.stack(anchor_idx)
+        pos_idx = torch.stack(pos_idx)
+        n_valid = len(anchor_idx)
+
+        anchor_hyp = h_hyp[anchor_idx]
+        pos_hyp = h_hyp[pos_idx]
+
+        pos_dist = hyp_distance(anchor_hyp, pos_hyp, c)  # [n_valid, 1]
+
+        k_neg = 32
+        neg_idx = torch.randint(0, len(hidden), (n_valid, k_neg)).cuda()
+        neg_hyp = h_hyp[neg_idx]  # [n_valid, k_neg, d]
+
+        anchor_exp = anchor_hyp.unsqueeze(1).expand(-1, k_neg, -1)
+        neg_dist = hyp_distance(
+            anchor_exp.reshape(-1, anchor_hyp.size(-1)),
+            neg_hyp.reshape(-1, anchor_hyp.size(-1)),
+            c
+        ).reshape(n_valid, k_neg)  # [n_valid, k_neg]
+
+        logits = torch.cat([-pos_dist / self.tau_cl, -neg_dist / self.tau_cl], dim=1)
+        labels = torch.zeros(n_valid, dtype=torch.long).cuda()
+        loss_cl = F.cross_entropy(logits, labels)
+
+        return loss_cl
 
     def evaluate(self, ):
         batch_size = self.n_batch

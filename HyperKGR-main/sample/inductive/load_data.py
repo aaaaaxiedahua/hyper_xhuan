@@ -57,18 +57,6 @@ class DataLoader:
         self.tra_KG, self.tra_sub = self.load_graph(self.tra_train)
         self.ind_KG, self.ind_sub = self.load_graph(self.ind_train, 'inductive')
 
-        # 加载预计算的 Ollivier-Ricci 曲率（与 KG 数组等长）
-        ricci_path_tra = os.path.join(task_dir, 'ricci_tra.npy')
-        ricci_path_ind = os.path.join(self.ind_dir, 'ricci_ind.npy')
-        if os.path.exists(ricci_path_tra) and os.path.exists(ricci_path_ind):
-            self.tra_ricci = np.load(ricci_path_tra).astype(np.float32)
-            self.ind_ricci = np.load(ricci_path_ind).astype(np.float32)
-            print('Ricci curvature loaded.')
-        else:
-            self.tra_ricci = np.zeros(len(self.tra_KG), dtype=np.float32)
-            self.ind_ricci = np.zeros(len(self.ind_KG), dtype=np.float32)
-            print('Ricci curvature files not found, using zeros.')
-
         self.tra_train = np.array(self.tra_valid)
         self.tra_val_qry, self.tra_val_ans = self.load_query(self.tra_test)
         self.ind_val_qry, self.ind_val_ans = self.load_query(self.ind_valid)
@@ -129,17 +117,14 @@ class DataLoader:
             KG    = self.tra_KG
             M_sub = self.tra_sub
             n_ent = self.n_ent
-            ricci = self.tra_ricci
         else:
             KG    = self.ind_KG
             M_sub = self.ind_sub
             n_ent = self.n_ent_ind
-            ricci = self.ind_ricci
 
         node_1hot = csr_matrix((np.ones(len(nodes)), (nodes[:,1], nodes[:,0])), shape=(n_ent, nodes.shape[0]))
         edge_1hot = M_sub.dot(node_1hot)
         edges = np.nonzero(edge_1hot)
-        ricci_vals = torch.FloatTensor(ricci[edges[0]]).cuda()     # Ricci values for selected edges
         selected_edges = np.concatenate([np.expand_dims(edges[1],1), KG[edges[0]]], axis=1)     # (batch_idx, head, rela, tail)
         selected_edges = torch.LongTensor(selected_edges).cuda()
 
@@ -151,7 +136,7 @@ class DataLoader:
         old_nodes_new_idx = tail_index[mask][old_idx]
         selected_edges = torch.cat([selected_edges, head_index.unsqueeze(1), tail_index.unsqueeze(1)], 1)
 
-        return tail_nodes, selected_edges, old_nodes_new_idx, ricci_vals
+        return tail_nodes, selected_edges, old_nodes_new_idx
 
     def get_batch(self, batch_idx, steps=2, data='train'):
         if data=='train':

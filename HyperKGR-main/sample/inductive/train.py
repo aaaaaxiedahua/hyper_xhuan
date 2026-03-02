@@ -8,11 +8,6 @@ from utils import select_gpu
 parser = argparse.ArgumentParser(description="Parser for AdaProp")
 parser.add_argument('--data_path', type=str, default='./data/fb237_v1')
 parser.add_argument('--seed', type=str, default=1234)
-parser.add_argument('--learnable_c', action='store_true', help='Enable learnable curvature')
-parser.add_argument('--path_comp', action='store_true', help='Enable Hyperbolic Relation Path Composition')
-parser.add_argument('--hyp_cl', action='store_true', help='Enable Hyperbolic Contrastive Learning')
-parser.add_argument('--lambda_cl', type=float, default=0.1, help='Weight for contrastive loss')
-parser.add_argument('--tau_cl', type=float, default=0.5, help='Temperature for contrastive loss')
 args = parser.parse_args()
 
 class Options(object):
@@ -58,16 +53,11 @@ def run_model(params):
     opts.n_batch = params['n_batch']
     opts.topk = params['topk']
     opts.increase = params['increase']
-    opts.learnable_c = args.learnable_c
-    opts.use_path_comp = args.path_comp
-    opts.use_hyp_cl = args.hyp_cl
-    opts.lambda_cl = args.lambda_cl
-    opts.tau_cl = args.tau_cl
 
     config_str = '%.4f, %.4f, %.6f,  %d, %d, %d, %d, %d, %.4f, %s  %d, %s\n' % (opts.lr, opts.decay_rate, opts.lamb, opts.hidden_dim, opts.init_dim, opts.attn_dim, opts.n_layer, opts.n_batch, opts.dropout, opts.act, opts.topk, str(opts.increase))
     print(args.data_path)
     print(config_str)
-    
+
     try:
         model = BaseModel(opts, loader)
         best_mrr = 0
@@ -88,10 +78,10 @@ def run_model(params):
             f.write(config_str)
             f.write(best_str + '\n')
             print('\n\n')
-            
+
     except RuntimeError:
         best_tmrr = 0
-    
+
     print('self.time_1, self.time_2, time_3, v_mrr, v_mr, v_h1, v_h3, v_h10, v_h1050, t_mrr, t_mr, t_h1, t_h3, t_h10, t_h1050')
     print(best_str)
     return
@@ -133,6 +123,6 @@ if 'nell_v3' in args.data_path:
 
 if 'nell_v4' in args.data_path:
     params['lr'], params['decay_rate'], params["lamb"], params['hidden_dim'],  params['init_dim'], params['attn_dim'], params['n_layer'], params['n_batch'], params['dropout'], params['act'],  params['topk'], params['increase'] = 0.0006, 0.9958, 0.000060,  16, 16, 5, 3, 50, 0.2411, 'relu', 100, True
-    
+
 print(params)
 run_model(params)

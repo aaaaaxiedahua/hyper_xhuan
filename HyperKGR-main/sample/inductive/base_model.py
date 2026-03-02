@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import time
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ExponentialLR
-from models import GNNModel, expmap0, hyp_distance
+from models import GNNModel
 from utils import cal_ranks, cal_performance
 
 class BaseModel(object):
@@ -24,9 +23,6 @@ class BaseModel(object):
         self.scheduler = ExponentialLR(self.optimizer, args.decay_rate)
         self.smooth = 1e-5
         self.params = args
-        self.use_hyp_cl = getattr(args, 'use_hyp_cl', False)
-        self.lambda_cl = getattr(args, 'lambda_cl', 0.1)
-        self.tau_cl = getattr(args, 'tau_cl', 0.5)
 
     def train_batch(self,):
         epoch_loss = 0
@@ -36,7 +32,7 @@ class BaseModel(object):
         self.model.train()
         self.time_1 = 0
         self.time_2 = 0
-        
+
         for i in range(n_batch):
             start = i*batch_size
             end = min(self.n_train, (i+1)*batch_size)
@@ -53,10 +49,6 @@ class BaseModel(object):
             max_n = torch.max(scores, 1, keepdim=True)[0]
             loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
 
-            if self.use_hyp_cl:
-                loss_cl = self.contrastive_loss()
-                loss = loss + self.lambda_cl * loss_cl
-
             loss.backward()
             self.optimizer.step()
             self.time_2 += time.time() - t_2
@@ -67,44 +59,11 @@ class BaseModel(object):
                 X[flag] = np.random.random()
                 p.data.copy_(X)
             epoch_loss += loss.item()
-            
+
         self.loader.shuffle_train()
         self.scheduler.step()
         valid_mrr, test_mrr, out_str = self.evaluate()
         return valid_mrr, test_mrr, out_str
-
-    def contrastive_loss(self):
-        z1 = self.model.cl_z1   # [n_node, d]
-        z2 = self.model.cl_z2   # [n_node, d]
-        c = self.model.layers[-1].curvature
-
-        n_node = z1.size(0)
-        n_cl = min(n_node, 256)
-        idx = torch.randperm(n_node, device=z1.device)[:n_cl]
-        z1 = z1[idx]
-        z2 = z2[idx]
-
-        z1_hyp = expmap0(z1, c)
-        z2_hyp = expmap0(z2, c)
-
-        # positive: same node under two dropout views
-        pos_dist = hyp_distance(z1_hyp, z2_hyp, c)   # [n_cl, 1]
-
-        # negative: different nodes
-        k_neg = 32
-        neg_idx = torch.randint(0, n_cl, (n_cl, k_neg), device=z1.device)
-        neg_hyp = z2_hyp[neg_idx]   # [n_cl, k_neg, d]
-
-        z1_exp = z1_hyp.unsqueeze(1).expand(-1, k_neg, -1)
-        neg_dist = hyp_distance(
-            z1_exp.reshape(-1, z1.size(-1)),
-            neg_hyp.reshape(-1, z1.size(-1)),
-            c
-        ).reshape(n_cl, k_neg)   # [n_cl, k_neg]
-
-        logits = torch.cat([-pos_dist / self.tau_cl, -neg_dist / self.tau_cl], dim=1)
-        labels = torch.zeros(n_cl, dtype=torch.long, device=z1.device)
-        return F.cross_entropy(logits, labels)
 
     def evaluate(self, ):
         batch_size = self.n_batch
@@ -128,11 +87,11 @@ class BaseModel(object):
                 filters.append(filt_1hot)
 
                 masks += [self.n_ent - len(filt)] * int(objs[i].sum())
-             
+
             filters = np.array(filters)
             ranks = cal_ranks(scores, objs, filters)
             ranking += ranks
-            
+
         ranking = np.array(ranking)
         v_mrr, v_mr, v_h1, v_h3, v_h10, v_h1050 = cal_performance(ranking, masks)
 
@@ -154,14 +113,13 @@ class BaseModel(object):
                 filt_1hot[np.array(filt)] = 1
                 filters.append(filt_1hot)
                 masks += [self.n_ent_ind - len(filt)] * int(objs[i].sum())
-             
+
             filters = np.array(filters)
             ranks = cal_ranks(scores, objs, filters)
             ranking += ranks
         ranking = np.array(ranking)
         t_mrr, t_mr, t_h1, t_h3, t_h10, t_h1050 = cal_performance(ranking, masks)
         time_3 = time.time() - time_3
-        
+
         out_str = '%.4f %.4f %.4f\t%.4f %.1f %.4f %.4f %.4f %.4f\t\t%.4f %.1f %.4f %.4f %.4f %.4f\n'%(self.time_1, self.time_2, time_3, v_mrr, v_mr, v_h1, v_h3, v_h10, v_h1050, t_mrr, t_mr, t_h1, t_h3, t_h10, t_h1050)
         return v_h10, t_h10, out_str
-    

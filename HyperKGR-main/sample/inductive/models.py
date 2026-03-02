@@ -245,14 +245,13 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_path_comp=False, learnable_c=False):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
-        self.use_path_comp = use_path_comp
         self.rela_embed = nn.Embedding(2*n_rel+1, in_dim)
 
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -261,16 +260,11 @@ class GNNLayer(torch.nn.Module):
         self.W_attn = nn.Linear(attn_dim, 1, bias=False)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        if use_path_comp:
-            self.Wp_attn = nn.Linear(in_dim, attn_dim, bias=False)
-
-        if learnable_c:
-            self.curvature = nn.Parameter(torch.tensor(1.0))
-        else:
-            self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
+        #self.curvature = torch.nn.Parameter(torch.tensor(1.0))
+        self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
 
 
-    def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx, path_state=None):
+    def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx):
         # edges:  [batch_idx, head, rela, tail, old_idx, new_idx]
         sub = edges[:,4]
         rel = edges[:,2]
@@ -285,11 +279,7 @@ class GNNLayer(torch.nn.Module):
 
         # put attention here, this for nell
         mess1 = hs
-        attn_input = self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
-        if self.use_path_comp and path_state is not None:
-            path_per_edge = path_state[r_idx]
-            attn_input = attn_input + self.Wp_attn(path_per_edge)
-        alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(attn_input)))
+        alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
         # suppose all embedding are in tangetn space
         hr = expmap0(hr, self.curvature) # to hyperbo
@@ -317,7 +307,7 @@ class GNNLayer(torch.nn.Module):
         hidden_new = logmap0(hidden_new, self.curvature)
 
         return hidden_new
-    
+
 
 
 # class GNNLayer(torch.nn.Module):
@@ -345,15 +335,15 @@ class GNNLayer(torch.nn.Module):
 
 #         r_idx = edges[:,0]
 #         h_qr = self.rela_embed(q_rel)[r_idx]
-#         mess1 = hs 
+#         mess1 = hs
 #         mess2 = mess1 + hr
 #         alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 #         message = mess2*alpha_2
 #         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
-        
+
 #         hidden_new =  self.W_h(message_agg)
 #         hidden_new = self.act(hidden_new)
-        
+
 #         return hidden_new
 
 
@@ -369,9 +359,6 @@ class GNNModel(torch.nn.Module):
         self.loader = loader
         self.increase = params.increase
         self.topk = params.topk
-        self.use_path_comp = getattr(params, 'use_path_comp', False)
-        self.use_hyp_cl = getattr(params, 'use_hyp_cl', False)
-        self.learnable_c = getattr(params, 'learnable_c', False)
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         dropout = params.dropout
@@ -379,16 +366,10 @@ class GNNModel(torch.nn.Module):
         self.layers = []
         self.Ws_layers = []
         for i in range(self.n_layer):
-            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_path_comp=self.use_path_comp, learnable_c=self.learnable_c))
+            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act))
             self.Ws_layers.append(nn.Linear(self.hidden_dim, 1, bias=False))
         self.layers = nn.ModuleList(self.layers)
         self.Ws_layers = nn.ModuleList(self.Ws_layers)
-
-        if self.use_path_comp:
-            self.path_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
-
-        if self.use_hyp_cl:
-            self.cl_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
 
         self.dropout = nn.Dropout(dropout)
         self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)         # get score
@@ -413,7 +394,7 @@ class GNNModel(torch.nn.Module):
         hard_all = torch.zeros((batch_size, n_ent)).bool().cuda()
         hard_all[r_idx,argtopk] = True
         bool_sampled_diff_nodes = hard_all[diff_nodes[:,0], diff_nodes[:,1]]
-        
+
         hidden[bool_diff_node_idx][bool_sampled_diff_nodes] *= (1 - diff_node_logits[bool_sampled_diff_nodes].detach() + diff_node_logits[bool_sampled_diff_nodes]).unsqueeze(1)
         bool_same_node_idx[bool_diff_node_idx] = bool_sampled_diff_nodes
 
@@ -430,31 +411,13 @@ class GNNModel(torch.nn.Module):
         time_1 = 0
         time_2 = 0
 
-        # path composition: init path_state with query relation embedding
-        if self.use_path_comp:
-            c = self.layers[0].curvature
-            path_state = self.path_rela_embed(q_rel)  # [n, d] tangent space
-
         for i in range(self.n_layer):
             t_1 = time.time()
             nodes, edges, old_nodes_new_idx = self.loader.get_neighbors(nodes.data.cpu().numpy(), mode)
             time_1 += time.time() - t_1
 
             t_2 = time.time()
-            ps = path_state if self.use_path_comp else None
-            hidden = self.layers[i](q_sub, q_rel, hidden, edges, nodes.size(0), old_nodes_new_idx, ps)
-
-            # update path_state via hyperbolic composition
-            if self.use_path_comp:
-                rel = edges[:, 2]
-                r_idx = edges[:, 0]
-                hr_path = self.path_rela_embed(rel)                                          # [N_edge, d]
-                rel_agg = scatter(hr_path, index=r_idx, dim=0, dim_size=n, reduce='mean')    # [n, d]
-                path_hyp = expmap0(path_state, c)
-                rel_hyp = expmap0(rel_agg, c)
-                path_hyp = project(mobius_add(path_hyp, rel_hyp, c), c)
-                path_state = logmap0(path_hyp, c)                                            # [n, d] back to tangent
-
+            hidden = self.layers[i](q_sub, q_rel, hidden, edges, nodes.size(0), old_nodes_new_idx)
             h0 = torch.zeros(1, nodes.size(0), hidden.size(1)).cuda().index_copy_(1, old_nodes_new_idx, h0)
             hidden = self.dropout(hidden)
             hidden, h0 = self.gru(hidden.unsqueeze(0), h0)
@@ -477,15 +440,6 @@ class GNNModel(torch.nn.Module):
         scores = self.W_final(hidden).squeeze(-1)
         scores_all = torch.zeros((n, n_ent)).cuda()
         scores_all[[nodes[:,0], nodes[:,1]]] = scores
-
-        # dropout augmentation for contrastive loss during training
-        if self.training and self.use_hyp_cl:
-            aug_1 = F.dropout(hidden, p=0.3, training=True)
-            aug_2 = F.dropout(hidden, p=0.3, training=True)
-            self.cl_z1 = self.cl_proj(aug_1)
-            self.cl_z2 = self.cl_proj(aug_2)
-
         return scores_all
-
 
 

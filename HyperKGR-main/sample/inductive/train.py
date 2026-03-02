@@ -8,6 +8,7 @@ from utils import select_gpu
 parser = argparse.ArgumentParser(description="Parser for AdaProp")
 parser.add_argument('--data_path', type=str, default='./data/fb237_v1')
 parser.add_argument('--seed', type=str, default=1234)
+parser.add_argument('--learnable_c', action='store_true', help='Enable learnable curvature')
 parser.add_argument('--path_comp', action='store_true', help='Enable Hyperbolic Relation Path Composition')
 parser.add_argument('--hyp_cl', action='store_true', help='Enable Hyperbolic Contrastive Learning')
 parser.add_argument('--lambda_cl', type=float, default=0.1, help='Weight for contrastive loss')
@@ -57,6 +58,7 @@ def run_model(params):
     opts.n_batch = params['n_batch']
     opts.topk = params['topk']
     opts.increase = params['increase']
+    opts.learnable_c = args.learnable_c
     opts.use_path_comp = args.path_comp
     opts.use_hyp_cl = args.hyp_cl
     opts.lambda_cl = args.lambda_cl

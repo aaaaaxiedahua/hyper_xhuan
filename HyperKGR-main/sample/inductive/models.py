@@ -245,7 +245,7 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_path_comp=False):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_path_comp=False, learnable_c=False):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
         self.in_dim = in_dim
@@ -264,7 +264,10 @@ class GNNLayer(torch.nn.Module):
         if use_path_comp:
             self.Wp_attn = nn.Linear(in_dim, attn_dim, bias=False)
 
-        self.curvature = nn.Parameter(torch.tensor(1.0))
+        if learnable_c:
+            self.curvature = nn.Parameter(torch.tensor(1.0))
+        else:
+            self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
 
 
     def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx, path_state=None):
@@ -368,6 +371,7 @@ class GNNModel(torch.nn.Module):
         self.topk = params.topk
         self.use_path_comp = getattr(params, 'use_path_comp', False)
         self.use_hyp_cl = getattr(params, 'use_hyp_cl', False)
+        self.learnable_c = getattr(params, 'learnable_c', False)
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         dropout = params.dropout
@@ -375,7 +379,7 @@ class GNNModel(torch.nn.Module):
         self.layers = []
         self.Ws_layers = []
         for i in range(self.n_layer):
-            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_path_comp=self.use_path_comp))
+            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_path_comp=self.use_path_comp, learnable_c=self.learnable_c))
             self.Ws_layers.append(nn.Linear(self.hidden_dim, 1, bias=False))
         self.layers = nn.ModuleList(self.layers)
         self.Ws_layers = nn.ModuleList(self.Ws_layers)

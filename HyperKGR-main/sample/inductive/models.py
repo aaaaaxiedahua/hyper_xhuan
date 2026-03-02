@@ -290,6 +290,7 @@ class GNNLayer(torch.nn.Module):
 
         if use_riemann:
             self.curvature = nn.Parameter(torch.tensor(0.5))
+            self.attn_temp = nn.Parameter(torch.tensor(1.0))
         else:
             self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
 
@@ -309,7 +310,11 @@ class GNNLayer(torch.nn.Module):
 
         # attention in tangent space
         mess1 = hs
-        alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
+        attn_logits = self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)))
+        if self.use_riemann:
+            alpha_2 = torch.sigmoid(attn_logits * self.attn_temp.clamp(min=0.1))
+        else:
+            alpha_2 = torch.sigmoid(attn_logits)
 
         c = safe_curvature(self.curvature).clamp(max=5.0)
 

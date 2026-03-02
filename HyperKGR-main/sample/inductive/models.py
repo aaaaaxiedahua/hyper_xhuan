@@ -263,6 +263,7 @@ class GNNLayer(torch.nn.Module):
 
         if use_hha:
             self.W_hier = nn.Linear(in_dim, 1, bias=False)
+            self.hier_scale = nn.Parameter(torch.tensor(0.0))  # 初始为0，从无HHA状态开始学
             self.curvature = nn.Parameter(torch.tensor(1.0))
         else:
             self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
@@ -289,11 +290,14 @@ class GNNLayer(torch.nn.Module):
         hr = expmap0(hr, self.curvature)
         hs = expmap0(hs, self.curvature)
 
-        # HHA: use hyperbolic norm as hierarchy signal
+        # HHA: use hyperbolic distance to origin as hierarchy signal
         if self.use_hha:
-            node_norm = torch.norm(hs, dim=-1, keepdim=True)   # [N_edge, 1]
-            hier_intent = self.W_hier(h_qr)                     # [N_edge, 1] (h_qr still in tangent space)
-            attn_logits = attn_logits + hier_intent * node_norm
+            c = safe_curvature(self.curvature)
+            sqrt_c = c ** 0.5
+            euc_norm = torch.norm(hs, dim=-1, keepdim=True).clamp_min(MIN_NORM)
+            node_hier = 2.0 / sqrt_c * artanh(sqrt_c * euc_norm)  # 双曲距离到原点 = 层级
+            hier_intent = self.W_hier(h_qr)                        # [N_edge, 1]
+            attn_logits = attn_logits + torch.tanh(self.hier_scale) * hier_intent * node_hier
 
         alpha_2 = torch.sigmoid(attn_logits)
 

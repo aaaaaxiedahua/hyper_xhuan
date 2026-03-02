@@ -322,10 +322,12 @@ class GNNLayer(torch.nn.Module):
         mess2 = project(mobius_add(hs, hr, c), c)
 
         if self.use_riemann:
-            # Einstein midpoint: aggregate directly on ball
+            # Einstein midpoint: aggregate directly on ball (weighted mean)
             message_agg = einstein_midpoint(mess2, alpha_2, obj, n_node, c)
-            # Möbius linear transform: logmap → W_h → expmap
             message_agg_tan = logmap0(message_agg, c)
+            # Scale by attention sum to recover sum-like magnitude (mean → sum)
+            attn_sum = scatter(alpha_2, index=obj, dim=0, dim_size=n_node, reduce='sum')
+            message_agg_tan = message_agg_tan * attn_sum
             a__ = self.W_h(message_agg_tan)
         else:
             # original: back to tangent space scatter_sum

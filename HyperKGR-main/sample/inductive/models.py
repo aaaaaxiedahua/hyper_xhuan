@@ -289,7 +289,7 @@ class GNNLayer(torch.nn.Module):
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
         if use_riemann:
-            self.curvature = nn.Parameter(torch.tensor(0.01))
+            self.curvature = nn.Parameter(torch.tensor(0.5))
         else:
             self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
 
@@ -410,10 +410,6 @@ class GNNModel(torch.nn.Module):
         self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)         # get score
         self.gru = nn.GRU(self.hidden_dim, self.hidden_dim)
 
-        if self.use_riemann:
-            self.target_rel_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
-            self.score_scale = nn.Parameter(torch.tensor(10.0))
-
     def soft_to_hard(self, i, hidden, nodes, n_ent, batch_size, old_nodes_new_idx):
         n_node = len(nodes)
         bool_diff_node_idx = torch.ones(n_node).bool().cuda()
@@ -476,24 +472,8 @@ class GNNModel(torch.nn.Module):
 
         self.time_1 = time_1
         self.time_2 = time_2
-        if self.use_riemann:
-            c = safe_curvature(self.layers[-1].curvature).clamp(max=5.0)
-            # map hidden to ball
-            hidden_hyp = expmap0(hidden, c)
-            # query target points
-            q_target = self.target_rel_embed(q_rel)          # [batch_size, d]
-            q_target_hyp = expmap0(q_target, c)               # [batch_size, d]
-            q_target_exp = q_target_hyp[nodes[:, 0]]           # [n_node, d]
-            # geodesic distance scoring: closer = higher score
-            dist = hyp_distance(hidden_hyp, q_target_exp, c, eval_mode=False).squeeze(-1)
-            scores = -self.score_scale * dist
-        else:
-            scores = self.W_final(hidden).squeeze(-1)
-
-        if self.use_riemann:
-            scores_all = torch.full((n, n_ent), -1e9).cuda()
-        else:
-            scores_all = torch.zeros((n, n_ent)).cuda()
+        scores = self.W_final(hidden).squeeze(-1)
+        scores_all = torch.zeros((n, n_ent)).cuda()
         scores_all[[nodes[:,0], nodes[:,1]]] = scores
         return scores_all
 

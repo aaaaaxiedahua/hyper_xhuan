@@ -244,15 +244,42 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 
+def einstein_midpoint(points, weights, index, dim_size, c):
+    """
+    Weighted Einstein midpoint (Fréchet mean) on Poincaré ball.
+
+    Args:
+        points: [N_edge, d] points on Poincaré ball
+        weights: [N_edge, 1] attention weights
+        index: [N_edge] target node indices
+        dim_size: number of target nodes
+        c: curvature
+    Returns:
+        [dim_size, d] aggregated result on ball
+    """
+    c = safe_curvature(c)
+    # Lorentz factor: γ_i = 1 / sqrt(1 - c * ||x_i||²)
+    x_norm_sq = torch.sum(points * points, dim=-1, keepdim=True)
+    gamma = 1.0 / torch.sqrt((1 - c * x_norm_sq).clamp_min(MIN_NORM))
+
+    # Weighted contribution: attention × Lorentz factor
+    w = weights * gamma
+    weighted_sum = scatter(w * points, index=index, dim=0, dim_size=dim_size, reduce='sum')
+    weight_sum = scatter(w, index=index, dim=0, dim_size=dim_size, reduce='sum').clamp_min(MIN_NORM)
+
+    midpoint = weighted_sum / weight_sum
+    return project(midpoint, c)
+
+
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_hha=False):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_riemann=False):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
-        self.use_hha = use_hha
+        self.use_riemann = use_riemann
         self.rela_embed = nn.Embedding(2*n_rel+1, in_dim)
 
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -261,9 +288,7 @@ class GNNLayer(torch.nn.Module):
         self.W_attn = nn.Linear(attn_dim, 1, bias=False)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        if use_hha:
-            self.W_hier = nn.Linear(in_dim, 1, bias=False)
-            self.hier_scale = nn.Parameter(torch.tensor(0.0))  # 初始为0，从无HHA状态开始学
+        if use_riemann:
             self.curvature = nn.Parameter(torch.tensor(1.0))
         else:
             self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
@@ -282,43 +307,36 @@ class GNNLayer(torch.nn.Module):
 
         h_qr = self.rela_embed(q_rel)[r_idx]
 
-        # compute attention logits in tangent space
+        # attention in tangent space
         mess1 = hs
-        attn_logits = self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)))
+        alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
-        # map to hyperbolic space
-        hr = expmap0(hr, self.curvature)
-        hs = expmap0(hs, self.curvature)
+        c = safe_curvature(self.curvature)
 
-        # HHA: use hyperbolic distance to origin as hierarchy signal
-        if self.use_hha:
-            c = safe_curvature(self.curvature)
-            sqrt_c = c ** 0.5
-            euc_norm = torch.norm(hs, dim=-1, keepdim=True).clamp_min(MIN_NORM)
-            node_hier = 2.0 / sqrt_c * artanh(sqrt_c * euc_norm)  # 双曲距离到原点 = 层级
-            hier_intent = self.W_hier(h_qr)                        # [N_edge, 1]
-            attn_logits = attn_logits + torch.tanh(self.hier_scale) * hier_intent * node_hier
+        # map to Poincaré ball
+        hr = expmap0(hr, c)
+        hs = expmap0(hs, c)
+        h_qr = expmap0(h_qr, c)
 
-        alpha_2 = torch.sigmoid(attn_logits)
+        # hyperbolic message: Möbius translation
+        mess2 = project(mobius_add(hs, hr, c), c)
 
-        mess1 = hs
-        h_qr = expmap0(h_qr, self.curvature)
+        if self.use_riemann:
+            # Einstein midpoint: aggregate directly on ball
+            message_agg = einstein_midpoint(mess2, alpha_2, obj, n_node, c)
+            # Möbius linear transform: logmap → W_h → expmap
+            message_agg_tan = logmap0(message_agg, c)
+            a__ = self.W_h(message_agg_tan)
+        else:
+            # original: back to tangent space scatter_sum
+            mess2 = logmap0(mess2, c)
+            message = mess2 * alpha_2
+            message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
+            a__ = self.W_h(message_agg)
 
-        mess2 = project(mobius_add(hs, hr, self.curvature), self.curvature)
-        #mess2 = hs + hr
-        mess2 = logmap0(mess2, self.curvature) # to tangent
-
-        message = mess2*alpha_2
-        message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
-
-        #hidden_new =  self.W_h(message_agg)
-        #hidden_new = self.act(hidden_new)
-
-        # to poincare space
-        a__ = self.W_h(message_agg)
-        a__ = expmap0(a__, self.curvature)
+        a__ = expmap0(a__, c)
         hidden_new = self.act(a__)
-        hidden_new = logmap0(hidden_new, self.curvature)
+        hidden_new = logmap0(hidden_new, c)
 
         return hidden_new
 
@@ -373,7 +391,7 @@ class GNNModel(torch.nn.Module):
         self.loader = loader
         self.increase = params.increase
         self.topk = params.topk
-        self.use_hha = getattr(params, 'use_hha', False)
+        self.use_riemann = getattr(params, 'use_riemann', False)
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         dropout = params.dropout
@@ -381,7 +399,7 @@ class GNNModel(torch.nn.Module):
         self.layers = []
         self.Ws_layers = []
         for i in range(self.n_layer):
-            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_hha=self.use_hha))
+            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_riemann=self.use_riemann))
             self.Ws_layers.append(nn.Linear(self.hidden_dim, 1, bias=False))
         self.layers = nn.ModuleList(self.layers)
         self.Ws_layers = nn.ModuleList(self.Ws_layers)
@@ -389,6 +407,10 @@ class GNNModel(torch.nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)         # get score
         self.gru = nn.GRU(self.hidden_dim, self.hidden_dim)
+
+        if self.use_riemann:
+            self.target_rel_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
+            self.score_scale = nn.Parameter(torch.tensor(1.0))
 
     def soft_to_hard(self, i, hidden, nodes, n_ent, batch_size, old_nodes_new_idx):
         n_node = len(nodes)
@@ -452,7 +474,20 @@ class GNNModel(torch.nn.Module):
 
         self.time_1 = time_1
         self.time_2 = time_2
-        scores = self.W_final(hidden).squeeze(-1)
+        if self.use_riemann:
+            c = safe_curvature(self.layers[-1].curvature)
+            # map hidden to ball
+            hidden_hyp = expmap0(hidden, c)
+            # query target points
+            q_target = self.target_rel_embed(q_rel)          # [batch_size, d]
+            q_target_hyp = expmap0(q_target, c)               # [batch_size, d]
+            q_target_exp = q_target_hyp[nodes[:, 0]]           # [n_node, d]
+            # geodesic distance scoring: closer = higher score
+            dist = hyp_distance(hidden_hyp, q_target_exp, c, eval_mode=False).squeeze(-1)
+            scores = -self.score_scale * dist
+        else:
+            scores = self.W_final(hidden).squeeze(-1)
+
         scores_all = torch.zeros((n, n_ent)).cuda()
         scores_all[[nodes[:,0], nodes[:,1]]] = scores
         return scores_all

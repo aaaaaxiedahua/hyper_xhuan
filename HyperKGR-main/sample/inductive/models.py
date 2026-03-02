@@ -272,8 +272,9 @@ def lorentz_expmap0(v, c):
     c = safe_curvature(c)
     sqrt_c = c ** 0.5
     v_norm = v.norm(dim=-1, keepdim=True).clamp_min(MIN_NORM)
-    x0 = (1.0 / sqrt_c) * torch.cosh(sqrt_c * v_norm)
-    x_spatial = (1.0 / sqrt_c) * torch.sinh(sqrt_c * v_norm) * v / v_norm
+    sqrt_c_vnorm = (sqrt_c * v_norm).clamp(max=50.0)  # prevent cosh/sinh overflow
+    x0 = (1.0 / sqrt_c) * torch.cosh(sqrt_c_vnorm)
+    x_spatial = (1.0 / sqrt_c) * torch.sinh(sqrt_c_vnorm) * v / v_norm
     return torch.cat([x0, x_spatial], dim=-1)
 
 

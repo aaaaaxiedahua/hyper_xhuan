@@ -289,7 +289,7 @@ class GNNLayer(torch.nn.Module):
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
         if use_riemann:
-            self.curvature = nn.Parameter(torch.tensor(1.0))
+            self.curvature = nn.Parameter(torch.tensor(0.01))
         else:
             self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
 
@@ -311,7 +311,7 @@ class GNNLayer(torch.nn.Module):
         mess1 = hs
         alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
-        c = safe_curvature(self.curvature)
+        c = safe_curvature(self.curvature).clamp(max=5.0)
 
         # map to Poincaré ball
         hr = expmap0(hr, c)
@@ -410,7 +410,7 @@ class GNNModel(torch.nn.Module):
 
         if self.use_riemann:
             self.target_rel_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
-            self.score_scale = nn.Parameter(torch.tensor(1.0))
+            self.score_scale = nn.Parameter(torch.tensor(10.0))
 
     def soft_to_hard(self, i, hidden, nodes, n_ent, batch_size, old_nodes_new_idx):
         n_node = len(nodes)
@@ -475,7 +475,7 @@ class GNNModel(torch.nn.Module):
         self.time_1 = time_1
         self.time_2 = time_2
         if self.use_riemann:
-            c = safe_curvature(self.layers[-1].curvature)
+            c = safe_curvature(self.layers[-1].curvature).clamp(max=5.0)
             # map hidden to ball
             hidden_hyp = expmap0(hidden, c)
             # query target points

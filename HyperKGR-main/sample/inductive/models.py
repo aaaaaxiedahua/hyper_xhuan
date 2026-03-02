@@ -245,13 +245,14 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_hha=False):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
+        self.use_hha = use_hha
         self.rela_embed = nn.Embedding(2*n_rel+1, in_dim)
 
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -260,8 +261,11 @@ class GNNLayer(torch.nn.Module):
         self.W_attn = nn.Linear(attn_dim, 1, bias=False)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        #self.curvature = torch.nn.Parameter(torch.tensor(1.0))
-        self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
+        if use_hha:
+            self.W_hier = nn.Linear(in_dim, 1, bias=False)
+            self.curvature = nn.Parameter(torch.tensor(1.0))
+        else:
+            self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
 
 
     def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx):
@@ -277,18 +281,24 @@ class GNNLayer(torch.nn.Module):
 
         h_qr = self.rela_embed(q_rel)[r_idx]
 
-        # put attention here, this for nell
+        # compute attention logits in tangent space
         mess1 = hs
-        alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
+        attn_logits = self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)))
 
-        # suppose all embedding are in tangetn space
-        hr = expmap0(hr, self.curvature) # to hyperbo
+        # map to hyperbolic space
+        hr = expmap0(hr, self.curvature)
         hs = expmap0(hs, self.curvature)
+
+        # HHA: use hyperbolic norm as hierarchy signal
+        if self.use_hha:
+            node_norm = torch.norm(hs, dim=-1, keepdim=True)   # [N_edge, 1]
+            hier_intent = self.W_hier(h_qr)                     # [N_edge, 1] (h_qr still in tangent space)
+            attn_logits = attn_logits + hier_intent * node_norm
+
+        alpha_2 = torch.sigmoid(attn_logits)
 
         mess1 = hs
         h_qr = expmap0(h_qr, self.curvature)
-        # or put attention here, this is for fb and winrr
-        #alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
         mess2 = project(mobius_add(hs, hr, self.curvature), self.curvature)
         #mess2 = hs + hr
@@ -359,6 +369,7 @@ class GNNModel(torch.nn.Module):
         self.loader = loader
         self.increase = params.increase
         self.topk = params.topk
+        self.use_hha = getattr(params, 'use_hha', False)
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         dropout = params.dropout
@@ -366,7 +377,7 @@ class GNNModel(torch.nn.Module):
         self.layers = []
         self.Ws_layers = []
         for i in range(self.n_layer):
-            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act))
+            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_hha=self.use_hha))
             self.Ws_layers.append(nn.Linear(self.hidden_dim, 1, bias=False))
         self.layers = nn.ModuleList(self.layers)
         self.Ws_layers = nn.ModuleList(self.Ws_layers)

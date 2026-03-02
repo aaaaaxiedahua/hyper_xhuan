@@ -488,7 +488,10 @@ class GNNModel(torch.nn.Module):
         else:
             scores = self.W_final(hidden).squeeze(-1)
 
-        scores_all = torch.zeros((n, n_ent)).cuda()
+        if self.use_riemann:
+            scores_all = torch.full((n, n_ent), -1e9).cuda()
+        else:
+            scores_all = torch.zeros((n, n_ent)).cuda()
         scores_all[[nodes[:,0], nodes[:,1]]] = scores
         return scores_all
 

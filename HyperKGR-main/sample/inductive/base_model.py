@@ -54,7 +54,7 @@ class BaseModel(object):
             loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
 
             if self.use_hyp_cl:
-                loss_cl = self.contrastive_loss(triple)
+                loss_cl = self.contrastive_loss()
                 loss = loss + self.lambda_cl * loss_cl
 
             loss.backward()
@@ -73,56 +73,38 @@ class BaseModel(object):
         valid_mrr, test_mrr, out_str = self.evaluate()
         return valid_mrr, test_mrr, out_str
 
-    def contrastive_loss(self, triple):
-        hidden = self.model.cl_hidden   # [n_node, d]
-        nodes = self.model.cl_nodes     # [n_node, 2] (batch_idx, entity_id)
+    def contrastive_loss(self):
+        z1 = self.model.cl_z1   # [n_node, d]
+        z2 = self.model.cl_z2   # [n_node, d]
         c = self.model.layers[-1].curvature
-        n = len(triple)
 
-        batch_ids = nodes[:, 0]
-        ent_ids = nodes[:, 1]
-        query_ents = torch.LongTensor(triple[:, 0]).cuda()
-        pos_ents = torch.LongTensor(triple[:, 2]).cuda()
+        n_node = z1.size(0)
+        n_cl = min(n_node, 256)
+        idx = torch.randperm(n_node, device=z1.device)[:n_cl]
+        z1 = z1[idx]
+        z2 = z2[idx]
 
-        h_hyp = expmap0(hidden, c)
+        z1_hyp = expmap0(z1, c)
+        z2_hyp = expmap0(z2, c)
 
-        anchor_idx = []
-        pos_idx = []
-        for i in range(n):
-            a_mask = (batch_ids == i) & (ent_ids == query_ents[i])
-            p_mask = (batch_ids == i) & (ent_ids == pos_ents[i])
-            if a_mask.any() and p_mask.any():
-                anchor_idx.append(a_mask.nonzero()[0, 0])
-                pos_idx.append(p_mask.nonzero()[0, 0])
+        # positive: same node under two dropout views
+        pos_dist = hyp_distance(z1_hyp, z2_hyp, c)   # [n_cl, 1]
 
-        if len(anchor_idx) == 0:
-            return torch.tensor(0.0).cuda()
-
-        anchor_idx = torch.stack(anchor_idx)
-        pos_idx = torch.stack(pos_idx)
-        n_valid = len(anchor_idx)
-
-        anchor_hyp = h_hyp[anchor_idx]
-        pos_hyp = h_hyp[pos_idx]
-
-        pos_dist = hyp_distance(anchor_hyp, pos_hyp, c)  # [n_valid, 1]
-
+        # negative: different nodes
         k_neg = 32
-        neg_idx = torch.randint(0, len(hidden), (n_valid, k_neg)).cuda()
-        neg_hyp = h_hyp[neg_idx]  # [n_valid, k_neg, d]
+        neg_idx = torch.randint(0, n_cl, (n_cl, k_neg), device=z1.device)
+        neg_hyp = z2_hyp[neg_idx]   # [n_cl, k_neg, d]
 
-        anchor_exp = anchor_hyp.unsqueeze(1).expand(-1, k_neg, -1)
+        z1_exp = z1_hyp.unsqueeze(1).expand(-1, k_neg, -1)
         neg_dist = hyp_distance(
-            anchor_exp.reshape(-1, anchor_hyp.size(-1)),
-            neg_hyp.reshape(-1, anchor_hyp.size(-1)),
+            z1_exp.reshape(-1, z1.size(-1)),
+            neg_hyp.reshape(-1, z1.size(-1)),
             c
-        ).reshape(n_valid, k_neg)  # [n_valid, k_neg]
+        ).reshape(n_cl, k_neg)   # [n_cl, k_neg]
 
         logits = torch.cat([-pos_dist / self.tau_cl, -neg_dist / self.tau_cl], dim=1)
-        labels = torch.zeros(n_valid, dtype=torch.long).cuda()
-        loss_cl = F.cross_entropy(logits, labels)
-
-        return loss_cl
+        labels = torch.zeros(n_cl, dtype=torch.long, device=z1.device)
+        return F.cross_entropy(logits, labels)
 
     def evaluate(self, ):
         batch_size = self.n_batch

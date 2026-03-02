@@ -264,8 +264,7 @@ class GNNLayer(torch.nn.Module):
         if use_path_comp:
             self.Wp_attn = nn.Linear(in_dim, attn_dim, bias=False)
 
-        #self.curvature = torch.nn.Parameter(torch.tensor(1.0))
-        self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
+        self.curvature = nn.Parameter(torch.tensor(1.0))
 
 
     def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx, path_state=None):
@@ -384,6 +383,9 @@ class GNNModel(torch.nn.Module):
         if self.use_path_comp:
             self.path_rela_embed = nn.Embedding(2*self.n_rel+1, self.hidden_dim)
 
+        if self.use_hyp_cl:
+            self.cl_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+
         self.dropout = nn.Dropout(dropout)
         self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)         # get score
         self.gru = nn.GRU(self.hidden_dim, self.hidden_dim)
@@ -472,10 +474,12 @@ class GNNModel(torch.nn.Module):
         scores_all = torch.zeros((n, n_ent)).cuda()
         scores_all[[nodes[:,0], nodes[:,1]]] = scores
 
-        # store hidden/nodes for contrastive loss during training
+        # dropout augmentation for contrastive loss during training
         if self.training and self.use_hyp_cl:
-            self.cl_hidden = hidden
-            self.cl_nodes = nodes
+            aug_1 = F.dropout(hidden, p=0.3, training=True)
+            aug_2 = F.dropout(hidden, p=0.3, training=True)
+            self.cl_z1 = self.cl_proj(aug_1)
+            self.cl_z2 = self.cl_proj(aug_2)
 
         return scores_all
 

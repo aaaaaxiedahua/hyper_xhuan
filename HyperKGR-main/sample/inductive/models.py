@@ -243,97 +243,17 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 
 ##########################################################################################################################################################################################
 
-# ################# LORENTZ MODEL OPS ########################
-
-def lorentz_inner(x, y):
-    """Minkowski inner product: <x,y>_L = -x_0*y_0 + sum(x_i*y_i)"""
-    return -x[..., 0:1] * y[..., 0:1] + (x[..., 1:] * y[..., 1:]).sum(dim=-1, keepdim=True)
-
-
-def lorentz_project(x, c):
-    """Project point onto hyperboloid: x_0 = sqrt(||x_spatial||^2 + 1/c)"""
-    c = safe_curvature(c)
-    spatial = x[..., 1:]
-    sq_norm = (spatial * spatial).sum(dim=-1, keepdim=True)
-    x0 = torch.sqrt(sq_norm + 1.0 / c).clamp_min(MIN_NORM)
-    return torch.cat([x0, spatial], dim=-1)
-
-
-def lorentz_expmap0(v, c):
-    """Exponential map at origin of the Lorentz model.
-    Maps tangent vector (d-dim) to hyperboloid point (d+1-dim).
-
-    Args:
-        v: [..., d] tangent vector at origin
-        c: curvature
-    Returns:
-        [..., d+1] point on hyperboloid
-    """
-    c = safe_curvature(c)
-    sqrt_c = c ** 0.5
-    v_norm = v.norm(dim=-1, keepdim=True).clamp_min(MIN_NORM)
-    sqrt_c_vnorm = (sqrt_c * v_norm).clamp(max=50.0)  # prevent cosh/sinh overflow
-    x0 = (1.0 / sqrt_c) * torch.cosh(sqrt_c_vnorm)
-    x_spatial = (1.0 / sqrt_c) * torch.sinh(sqrt_c_vnorm) * v / v_norm
-    return torch.cat([x0, x_spatial], dim=-1)
-
-
-def lorentz_logmap0(x, c):
-    """Logarithmic map at origin of the Lorentz model.
-    Maps hyperboloid point (d+1-dim) to tangent vector (d-dim).
-
-    Args:
-        x: [..., d+1] point on hyperboloid
-        c: curvature
-    Returns:
-        [..., d] tangent vector at origin
-    """
-    c = safe_curvature(c)
-    sqrt_c = c ** 0.5
-    x0 = x[..., 0:1]
-    x_spatial = x[..., 1:]
-    x_spatial_norm = x_spatial.norm(dim=-1, keepdim=True).clamp_min(MIN_NORM)
-    theta = torch.acosh((sqrt_c * x0).clamp_min(1.0 + 1e-7))
-    coeff = theta / (sqrt_c * x_spatial_norm)
-    return coeff * x_spatial
-
-
-def givens_rotation(x, angles):
-    """Apply Givens rotations to spatial dimensions of a Lorentz vector.
-    Rotation only acts on spatial dims (x[1:]), time dim (x[0]) unchanged,
-    so the result stays on the hyperboloid.
-
-    Args:
-        x: [..., d+1] point on hyperboloid
-        angles: [..., d//2] rotation angles per dimension pair
-    Returns:
-        [..., d+1] rotated point on hyperboloid
-    """
-    x0 = x[..., 0:1]
-    x_spatial = x[..., 1:]
-
-    cos_a = torch.cos(angles)
-    sin_a = torch.sin(angles)
-
-    x_even = x_spatial[..., 0::2]
-    x_odd = x_spatial[..., 1::2]
-
-    new_even = cos_a * x_even - sin_a * x_odd
-    new_odd = sin_a * x_even + cos_a * x_odd
-
-    x_rotated = torch.stack([new_even, new_odd], dim=-1).reshape_as(x_spatial)
-    return torch.cat([x0, x_rotated], dim=-1)
-
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_lorentz=False):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, act=lambda x:x, use_fm=False, use_riem=False):
         super(GNNLayer, self).__init__()
         self.n_rel = n_rel
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.attn_dim = attn_dim
         self.act = act
-        self.use_lorentz = use_lorentz
+        self.use_fm = use_fm
+        self.use_riem = use_riem
         self.rela_embed = nn.Embedding(2*n_rel+1, in_dim)
 
         self.Ws_attn = nn.Linear(in_dim, attn_dim, bias=False)
@@ -342,13 +262,16 @@ class GNNLayer(torch.nn.Module):
         self.W_attn = nn.Linear(attn_dim, 1, bias=False)
         self.W_h = nn.Linear(in_dim, out_dim, bias=False)
 
-        if use_lorentz:
-            self.curvature = nn.Parameter(torch.tensor(1.0))
-            self.rel_angles = nn.Embedding(2*n_rel+1, in_dim // 2)
-            nn.init.uniform_(self.rel_angles.weight, -0.1, 0.1)
-        else:
-            #self.curvature = torch.nn.Parameter(torch.tensor(1.0))
-            self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
+        # FM second-order aggregation
+        if self.use_fm:
+            self.W_2nd = nn.Linear(in_dim, out_dim, bias=False)
+
+        # Riemannian correction
+        if self.use_riem:
+            self.c_eff = nn.Parameter(torch.tensor(0.01))
+
+        #self.curvature = torch.nn.Parameter(torch.tensor(1.0))
+        self.curvature = torch.tensor(MIN_CURVATURE, requires_grad=False)
 
 
     def forward(self, q_sub, q_rel, hidden, edges, n_node, old_nodes_new_idx):
@@ -358,54 +281,61 @@ class GNNLayer(torch.nn.Module):
         obj = edges[:,5]
         hs = hidden[sub]
         hr = self.rela_embed(rel)
+        #hr = rel
 
         r_idx = edges[:,0]
+
         h_qr = self.rela_embed(q_rel)[r_idx]
 
-        # attention in tangent space (same for both modes)
+        # put attention here, this for nell
         mess1 = hs
         alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
-        if self.use_lorentz:
-            c = self.curvature.clamp_min(MIN_CURVATURE)
+        # save tangent space vectors before expmap overwrites them
+        if self.use_riem:
+            hs_tan = hs
+            hr_tan = hr
 
-            # tangent space translation + map to hyperboloid
-            mess_tangent = hs + hr                          # [E, d]
-            mess_L = lorentz_expmap0(mess_tangent, c)       # [E, d+1]
+        # suppose all embedding are in tangetn space
+        hr = expmap0(hr, self.curvature) # to hyperbo
+        hs = expmap0(hs, self.curvature)
 
-            # Givens rotation on hyperboloid (relation-specific)
-            angles = self.rel_angles(rel)                   # [E, d//2]
-            mess_L = givens_rotation(mess_L, angles)        # [E, d+1]
+        mess1 = hs
+        h_qr = expmap0(h_qr, self.curvature)
+        # or put attention here, this is for fb and winrr
+        #alpha_2 = torch.sigmoid(self.W_attn(nn.ReLU()(self.Ws_attn(mess1) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))))
 
-            # map back to tangent space
-            mess2 = lorentz_logmap0(mess_L, c)              # [E, d]
+        mess2 = project(mobius_add(hs, hr, self.curvature), self.curvature)
+        #mess2 = hs + hr
+        mess2 = logmap0(mess2, self.curvature) # to tangent
 
-            # weighted aggregation in tangent space
-            message = mess2 * alpha_2
-            message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
+        # Riemannian correction: first-order curvature term from Taylor expansion of mobius_add
+        if self.use_riem:
+            hr_sq = (hr_tan * hr_tan).sum(dim=-1, keepdim=True)
+            hs_sq = (hs_tan * hs_tan).sum(dim=-1, keepdim=True)
+            hs_hr = (hs_tan * hr_tan).sum(dim=-1, keepdim=True)
+            riem_corr = hr_sq * hs_tan - (hs_sq + 2.0 * hs_hr) * hr_tan
+            mess2 = mess2 + self.c_eff * riem_corr
 
-            # output transform through hyperboloid
-            a__ = self.W_h(message_agg)                     # [N, d]
-            a_L = lorentz_expmap0(a__, c)                   # [N, d+1]
-            spatial_act = self.act(a_L[..., 1:])            # activate spatial dims
-            a_L = lorentz_project(torch.cat([a_L[..., 0:1], spatial_act], -1), c)
-            hidden_new = lorentz_logmap0(a_L, c)            # [N, d]
+        message = mess2*alpha_2
+
+        # FM second-order aggregation
+        if self.use_fm:
+            first_order = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
+            sum_of_squares = scatter(message ** 2, index=obj, dim=0, dim_size=n_node, reduce='sum')
+            second_order = 0.5 * (first_order ** 2 - sum_of_squares)
+            message_agg = first_order + self.W_2nd(second_order)
         else:
-            # original Poincare code
-            hr = expmap0(hr, self.curvature)
-            hs = expmap0(hs, self.curvature)
-            h_qr = expmap0(h_qr, self.curvature)
-
-            mess2 = project(mobius_add(hs, hr, self.curvature), self.curvature)
-            mess2 = logmap0(mess2, self.curvature)
-
-            message = mess2*alpha_2
             message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
 
-            a__ = self.W_h(message_agg)
-            a__ = expmap0(a__, self.curvature)
-            hidden_new = self.act(a__)
-            hidden_new = logmap0(hidden_new, self.curvature)
+        #hidden_new =  self.W_h(message_agg)
+        #hidden_new = self.act(hidden_new)
+
+        # to poincare space
+        a__ = self.W_h(message_agg)
+        a__ = expmap0(a__, self.curvature)
+        hidden_new = self.act(a__)
+        hidden_new = logmap0(hidden_new, self.curvature)
 
         return hidden_new
 
@@ -460,7 +390,8 @@ class GNNModel(torch.nn.Module):
         self.loader = loader
         self.increase = params.increase
         self.topk = params.topk
-        self.use_lorentz = getattr(params, 'use_lorentz', False)
+        self.use_fm = getattr(params, 'use_fm', False)
+        self.use_riem = getattr(params, 'use_riem', False)
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act = acts[params.act]
         dropout = params.dropout
@@ -468,7 +399,7 @@ class GNNModel(torch.nn.Module):
         self.layers = []
         self.Ws_layers = []
         for i in range(self.n_layer):
-            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_lorentz=self.use_lorentz))
+            self.layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, act=act, use_fm=self.use_fm, use_riem=self.use_riem))
             self.Ws_layers.append(nn.Linear(self.hidden_dim, 1, bias=False))
         self.layers = nn.ModuleList(self.layers)
         self.Ws_layers = nn.ModuleList(self.Ws_layers)

@@ -265,6 +265,7 @@ class GNNLayer(torch.nn.Module):
         # FM second-order aggregation
         if self.use_fm:
             self.W_2nd = nn.Linear(in_dim, out_dim, bias=False)
+            self.fm_gate = nn.Parameter(torch.tensor(-2.0))  # sigmoid(-2)≈0.12, starts small
 
         # Riemannian correction
         if self.use_riem:
@@ -324,7 +325,9 @@ class GNNLayer(torch.nn.Module):
             first_order = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
             sum_of_squares = scatter(message ** 2, index=obj, dim=0, dim_size=n_node, reduce='sum')
             second_order = 0.5 * (first_order ** 2 - sum_of_squares)
-            message_agg = first_order + self.W_2nd(second_order)
+            second_order = F.layer_norm(second_order, [second_order.size(-1)])
+            gate = torch.sigmoid(self.fm_gate)
+            message_agg = first_order + gate * self.W_2nd(second_order)
         else:
             message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
 
